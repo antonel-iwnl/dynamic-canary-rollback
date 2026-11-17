@@ -1,0 +1,44 @@
+services:
+  api_stable:
+    build: ./api
+    container_name: api_stable
+    ports:
+      - "8000:8000"
+    environment:
+      - VERSION=stable
+
+  api_canary:
+    build: ./api
+    container_name: api_canary
+    ports:
+      - "8001:8000"
+    environment:
+      - VERSION=canary_poisoned
+
+  load_tester:
+    image: locustio/locust
+    container_name: load_tester
+    volumes:
+      - ./load_tester:/mnt/locust
+    environment:
+      - CANARY_HOST=http://api_canary:8000
+    command: -f /mnt/locust/locustfile.py --headless -u 50 -r 10 -H http://api_stable:8000
+    depends_on:
+      - api_stable
+      - api_canary
+
+  ml_monitor:
+    build: ./ml_monitor
+    container_name: ml_monitor
+    volumes:
+      - ./ml_monitor:/app
+    environment:
+      - STABLE_METRICS_URL=http://api_stable:8000/metrics
+      - CANARY_METRICS_URL=http://api_canary:8000/metrics
+      - POLL_INTERVAL=2.0
+      - BASELINE_SAMPLES=100
+      - CSV_OUTPUT=/app/collected_metrics.csv
+    depends_on:
+      - api_stable
+      - api_canary
+      - load_tester
