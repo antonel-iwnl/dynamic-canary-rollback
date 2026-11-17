@@ -18,9 +18,23 @@ from sklearn.metrics import (
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-FEATURE_COLUMNS = ["cpu_usage", "memory_usage", "request_latency"]
+RAW_COLUMNS = [
+    "requests_per_second",
+    "cpu_usage",
+    "memory_usage",
+    "request_latency",
+]
+
+MODEL_FEATURE_COLUMNS = [
+    "requests_per_second",
+    "cpu_usage",
+    "cpu_per_rps",
+    "memory_usage",
+    "request_latency",
+]
 
 PROMETHEUS_METRIC_MAP = {
+    "app_requests_per_second": "requests_per_second",
     "app_cpu_usage_percent": "cpu_usage",
     "app_memory_usage_mb": "memory_usage",
     "app_request_latency_seconds": "request_latency",
@@ -30,7 +44,7 @@ PROMETHEUS_METRIC_MAP = {
 def fetch_metrics(metrics_url: str, timeout: float = 5.0) -> Optional[Dict[str, float]]:
     """
     Fetches Prometheus text-format metrics from the given `/metrics` endpoint
-    and extracts CPU usage, memory usage, and request latency.
+    and extracts request rate (RPS), CPU usage, memory usage, and request latency.
     """
     try:
         response = requests.get(metrics_url, timeout=timeout)
@@ -53,7 +67,11 @@ def fetch_metrics(metrics_url: str, timeout: float = 5.0) -> Optional[Dict[str, 
                     except ValueError:
                         pass
 
-    if all(col in extracted for col in FEATURE_COLUMNS):
+    # Fallback if an older container without app_requests_per_second is scraped
+    if "requests_per_second" not in extracted:
+        extracted["requests_per_second"] = 25.0
+
+    if all(col in extracted for col in RAW_COLUMNS):
         return extracted
 
     print(f"[WARN] Incomplete metrics payload from {metrics_url}: {extracted}")
@@ -62,38 +80,43 @@ def fetch_metrics(metrics_url: str, timeout: float = 5.0) -> Optional[Dict[str, 
 
 def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Data Preprocessing Step:
-    1. Selects the relevant system telemetry features (CPU %, Memory MB, Request Latency s).
-    2. Replaces any infinite values with NaN and imputes missing values via forward-fill
-       followed by median fallback.
-    3. Clips physically impossible negative readings to 0.0.
+    Data Preprocessing & Traffic-Aware Feature Engineering Step:
+    1. Ensures all raw telemetry columns exist and sanitizes NaN/Inf values.
+    2. Engineers `cpu_per_rps` = `cpu_usage / max(requests_per_second, 1.0)` so the model
+       distinguishes legitimate user traffic surges (high RPS + proportional CPU)
+       from software regressions (high CPU/memory/latency relative to traffic).
     """
-    clean_df = df[FEATURE_COLUMNS].copy()
+    clean_df = df.copy()
+    if "requests_per_second" not in clean_df.columns:
+        clean_df["requests_per_second"] = 25.0
+
+    clean_df = clean_df[RAW_COLUMNS].copy()
     clean_df.replace([np.inf, -np.inf], np.nan, inplace=True)
     clean_df.ffill(inplace=True)
     clean_df.fillna(clean_df.median(numeric_only=True), inplace=True)
     clean_df = clean_df.clip(lower=0.0)
-    return clean_df
+
+    clean_df["cpu_per_rps"] = clean_df["cpu_usage"] / np.maximum(
+        clean_df["requests_per_second"], 1.0
+    )
+    return clean_df[MODEL_FEATURE_COLUMNS]
 
 
 def train_baseline(
     df: pd.DataFrame,
     n_samples: Optional[int] = None,
-    contamination: float = 0.02,
+    contamination: float = 0.01,
     random_state: int = 42,
 ) -> Pipeline:
     """
-    Model Training Step:
-    1. Preprocesses the collected stable baseline data points.
-    2. Standardizes features using `StandardScaler` (zero mean, unit variance) so metrics
-       with different units (% vs. MB vs. seconds) are normalized cleanly.
-    3. Trains a scikit-learn `IsolationForest` on the preprocessed baseline data.
+    Trains a scikit-learn Pipeline (`StandardScaler` + `IsolationForest`) on the
+    baseline data points collected under dynamic traffic waves (including user surges).
     """
     raw_baseline = df.head(n_samples) if n_samples else df
     baseline_features = preprocess_data(raw_baseline)
 
     print(
-        f"\n[BASELINE] Preprocessing & training IsolationForest on {len(baseline_features)} stable data points..."
+        f"\n[BASELINE] Preprocessing & training traffic-aware IsolationForest on {len(baseline_features)} stable data points..."
     )
     print(
         f"[BASELINE] Feature summary:\n{baseline_features.describe().loc[['mean', 'std', 'min', 'max']]}\n"
@@ -114,20 +137,18 @@ def train_baseline(
         ]
     )
     model.fit(baseline_features)
-    print("[BASELINE] IsolationForest pipeline training complete.\n")
+    print("[BASELINE] Traffic-aware IsolationForest training complete.\n")
     return model
 
 
 def monitor_canary(
     model: Pipeline,
     data_point: pd.DataFrame,
+    phase_label: str = "CANARY",
 ) -> Tuple[int, float]:
     """
-    Evaluates new incoming canary data point(s) using the trained preprocessing + IsolationForest pipeline.
+    Evaluates incoming telemetry data point(s) using the trained IsolationForest pipeline.
     Runs `model.predict()` and prints the rollback alert if an anomaly (-1) is detected.
-
-    Returns:
-        (prediction, anomaly_score) where prediction is 1 (normal) or -1 (anomaly).
     """
     features = preprocess_data(data_point)
     prediction = int(model.predict(features)[0])
@@ -135,26 +156,30 @@ def monitor_canary(
 
     row = features.iloc[0]
     metrics_str = (
-        f"CPU={row['cpu_usage']:.2f}%, "
-        f"MEM={row['memory_usage']:.2f}MB, "
-        f"LATENCY={row['request_latency']:.4f}s "
-        f"(score={score:.4f})"
+        f"[{phase_label}] RPS={row['requests_per_second']:5.1f}/s | "
+        f"CPU={row['cpu_usage']:5.2f}% (CPU/RPS={row['cpu_per_rps']:.2f}) | "
+        f"MEM={row['memory_usage']:6.2f}MB | "
+        f"LAT={row['request_latency']:.4f}s "
+        f"(score={score:+.4f})"
     )
 
     if prediction == -1:
         print(f"[ALERT] {metrics_str} -> ANOMALY DETECTED: INITIATING ROLLBACK")
     else:
-        print(f"[OK]    {metrics_str} -> Canary operating within normal baseline.")
+        surge_note = (
+            " [Traffic Surge Handled]"
+            if row["requests_per_second"] >= 45.0 or row["cpu_usage"] >= 30.0
+            else ""
+        )
+        print(f"[OK]    {metrics_str} -> Normal{surge_note}")
 
     return prediction, score
 
 
 def evaluate_model(metrics_df: pd.DataFrame) -> None:
     """
-    Model Evaluation & Validation Step:
     Compares IsolationForest predictions against ground-truth deployment labels
-    (`stable` = 0 normal, `canary` = 1 anomalous) and prints Precision, Recall,
-    F1-Score, False Positive Rate, and the Confusion Matrix.
+    (`stable` / `stable_val` = 0 normal, `canary` = 1 anomalous).
     """
     if "version" not in metrics_df.columns or len(metrics_df) == 0:
         return
@@ -163,7 +188,6 @@ def evaluate_model(metrics_df: pd.DataFrame) -> None:
     y_pred = np.where(metrics_df["prediction"] == -1, 1, 0)
 
     if len(np.unique(y_true)) < 2:
-        print("[EVALUATION] Only one class present in telemetry; skipping binary classification metrics.")
         return
 
     precision = precision_score(y_true, y_pred, zero_division=0)
@@ -175,7 +199,9 @@ def evaluate_model(metrics_df: pd.DataFrame) -> None:
     print("\n=================================================================")
     print(" Phase 3: Model Evaluation & Live Validation Summary")
     print("=================================================================")
-    print(f" Total Telemetry Samples : {len(metrics_df)} (Stable={tn + fp}, Canary={tp + fn})")
+    print(
+        f" Total Telemetry Samples : {len(metrics_df)} (Healthy Stable={tn + fp}, Poisoned Canary={tp + fn})"
+    )
     print(f" True Positives  (TP)    : {tp:4d} | False Positives (FP) : {fp:4d}")
     print(f" True Negatives  (TN)    : {tn:4d} | False Negatives (FN) : {fn:4d}")
     print(f" Precision               : {precision:.4f}")
@@ -190,27 +216,26 @@ def run_pipeline(
     canary_url: str,
     poll_interval: float = 2.0,
     baseline_samples: int = 100,
-    contamination: float = 0.02,
+    stable_validation_samples: int = 30,
+    contamination: float = 0.01,
     max_canary_samples: Optional[int] = None,
     rollback_threshold: int = 3,
     csv_output: str = "collected_metrics.csv",
 ) -> None:
-    """
-    Full monitoring pipeline:
-    1. Polls `stable_url` every `poll_interval` seconds until `baseline_samples`
-       data points are accumulated in a Pandas DataFrame.
-    2. Calls `train_baseline()` to preprocess and fit the IsolationForest model,
-       then records baseline predictions and decision scores.
-    3. Polls `canary_url` every `poll_interval` seconds, accumulates points into the DataFrame,
-       and passes each new point to `monitor_canary()`.
-    4. Runs `evaluate_model()` to report live validation metrics and exports the CSV.
-    """
     metrics_df = pd.DataFrame(
-        columns=["timestamp", "version", *FEATURE_COLUMNS, "prediction", "score"]
+        columns=[
+            "timestamp",
+            "version",
+            *RAW_COLUMNS,
+            "cpu_per_rps",
+            "prediction",
+            "score",
+        ]
     )
 
     print("=================================================================")
-    print(" Phase 1: Collecting Baseline Telemetry from Stable API")
+    print(" Phase 1: Collecting Dynamic Baseline Telemetry from Stable API")
+    print(" (Includes normal diurnal load + flash-crowd user influx waves)")
     print(f" Target URL   : {stable_url}")
     print(f" Poll Interval: {poll_interval}s | Target Samples: {baseline_samples}")
     print("=================================================================")
@@ -218,20 +243,26 @@ def run_pipeline(
     while len(metrics_df) < baseline_samples:
         sample = fetch_metrics(stable_url)
         if sample is not None:
+            cpu_per_rps = sample["cpu_usage"] / max(sample["requests_per_second"], 1.0)
             record = {
                 "timestamp": datetime.utcnow().isoformat(),
                 "version": "stable",
                 **sample,
+                "cpu_per_rps": round(cpu_per_rps, 4),
                 "prediction": 1,
                 "score": 0.0,
             }
             metrics_df.loc[len(metrics_df)] = record
             idx = len(metrics_df)
+            spike_tag = (
+                " [USER INFLUX]" if sample["requests_per_second"] >= 45.0 else ""
+            )
             print(
                 f"[COLLECT {idx:03d}/{baseline_samples:03d}] "
-                f"CPU={sample['cpu_usage']:.2f}% | "
-                f"MEM={sample['memory_usage']:.2f}MB | "
-                f"LATENCY={sample['request_latency']:.4f}s"
+                f"RPS={sample['requests_per_second']:5.1f}/s | "
+                f"CPU={sample['cpu_usage']:5.2f}% | "
+                f"MEM={sample['memory_usage']:6.2f}MB | "
+                f"LAT={sample['request_latency']:.4f}s{spike_tag}"
             )
         time.sleep(poll_interval)
 
@@ -244,11 +275,40 @@ def run_pipeline(
 
     # Backfill actual model predictions & anomaly scores onto the baseline rows
     clean_baseline = preprocess_data(metrics_df)
+    metrics_df["cpu_per_rps"] = clean_baseline["cpu_per_rps"]
     metrics_df["prediction"] = model.predict(clean_baseline)
     metrics_df["score"] = model.decision_function(clean_baseline)
 
-    print("=================================================================")
-    print(" Phase 2: Monitoring Canary Deployment")
+    if stable_validation_samples > 0:
+        print("=================================================================")
+        print(" Phase 2A: Validating Model on Unseen Stable Traffic Waves")
+        print(" (Verifying that user influx spikes do NOT cause false rollbacks)")
+        print(f" Target URL   : {stable_url} | Samples: {stable_validation_samples}")
+        print("=================================================================")
+        val_count = 0
+        while val_count < stable_validation_samples:
+            sample = fetch_metrics(stable_url)
+            if sample is not None:
+                val_count += 1
+                single_point_df = pd.DataFrame([sample])
+                pred, score = monitor_canary(
+                    model, single_point_df, phase_label="STABLE-VAL"
+                )
+                cpu_per_rps = sample["cpu_usage"] / max(
+                    sample["requests_per_second"], 1.0
+                )
+                metrics_df.loc[len(metrics_df)] = {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "version": "stable_val",
+                    **sample,
+                    "cpu_per_rps": round(cpu_per_rps, 4),
+                    "prediction": pred,
+                    "score": score,
+                }
+            time.sleep(poll_interval)
+
+    print("\n=================================================================")
+    print(" Phase 2B: Monitoring Canary Deployment")
     print(f" Target URL   : {canary_url}")
     print(
         f" Poll Interval: {poll_interval}s | Consecutive Alert Rollback: {rollback_threshold}"
@@ -264,12 +324,18 @@ def run_pipeline(
             if sample is not None:
                 canary_count += 1
                 single_point_df = pd.DataFrame([sample])
-                pred, score = monitor_canary(model, single_point_df)
+                pred, score = monitor_canary(
+                    model, single_point_df, phase_label="CANARY"
+                )
+                cpu_per_rps = sample["cpu_usage"] / max(
+                    sample["requests_per_second"], 1.0
+                )
 
                 record = {
                     "timestamp": datetime.utcnow().isoformat(),
                     "version": "canary",
                     **sample,
+                    "cpu_per_rps": round(cpu_per_rps, 4),
                     "prediction": pred,
                     "score": score,
                 }
@@ -299,7 +365,7 @@ def run_pipeline(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Dynamic Canary Rollback ML Monitor using IsolationForest"
+        description="Dynamic Canary Rollback ML Monitor using Traffic-Aware IsolationForest"
     )
     parser.add_argument(
         "--stable-url",
@@ -320,20 +386,26 @@ if __name__ == "__main__":
     parser.add_argument(
         "--baseline-samples",
         type=int,
-        default=int(os.getenv("BASELINE_SAMPLES", "100")),
-        help="Number of stable baseline samples to collect before training (default: 100)",
+        default=int(os.getenv("BASELINE_SAMPLES", "120")),
+        help="Number of stable baseline samples to collect before training (default: 120)",
+    )
+    parser.add_argument(
+        "--stable-val-samples",
+        type=int,
+        default=int(os.getenv("STABLE_VAL_SAMPLES", "30")),
+        help="Number of unseen stable samples (including traffic spikes) to validate before switching to canary (default: 30)",
     )
     parser.add_argument(
         "--contamination",
         type=float,
-        default=float(os.getenv("CONTAMINATION", "0.02")),
-        help="IsolationForest contamination hyperparameter (default: 0.02)",
+        default=float(os.getenv("CONTAMINATION", "0.01")),
+        help="IsolationForest contamination hyperparameter (default: 0.01)",
     )
     parser.add_argument(
         "--rollback-threshold",
         type=int,
-        default=int(os.getenv("ROLLBACK_THRESHOLD", "3")),
-        help="Consecutive anomalies required to halt canary and finalize rollback (default: 3)",
+        default=int(os.getenv("ROLLBACK_THRESHOLD", "15")),
+        help="Consecutive anomalies required to halt canary and finalize rollback (default: 15)",
     )
     parser.add_argument(
         "--max-canary-samples",
@@ -353,6 +425,7 @@ if __name__ == "__main__":
         canary_url=args.canary_url,
         poll_interval=args.interval,
         baseline_samples=args.baseline_samples,
+        stable_validation_samples=args.stable_val_samples,
         contamination=args.contamination,
         max_canary_samples=args.max_canary_samples,
         rollback_threshold=args.rollback_threshold,
